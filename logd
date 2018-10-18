@@ -1,0 +1,105 @@
+#!/usr/bin/py
+
+#!--Init
+import os,sys
+work_dir = os.path.split(os.path.realpath(__file__))[0]
+os.chdir(work_dir)
+import sys
+sys.path.append("./lib")
+
+from socketserver import BaseRequestHandler, ThreadingUDPServer
+from threading import Lock,Thread
+from time import time,sleep
+from datetime import datetime,timedelta
+from importlib import reload
+import log_parser as parser
+from struct_def import Syslog_t
+from pandas import DataFrame
+
+def counter(interval):
+  from pymongo import MongoClient
+  prev_acc_count = 0
+  cur_count = 0
+  acc_count = 0
+  speed = 0
+  while(True):
+    sleep(interval)
+    acc_count = SyslogHandler.count
+    cur_count = acc_count - prev_acc_count
+    speed = cur_count/interval
+    insert_record = {
+      "time_stamp": datetime.now(),
+      "cur_count": cur_count,
+      "acc_count": acc_count,
+      "log_speed": speed,
+    }
+#    print(insert_record)
+    tb = MongoClient().syslogdb.statistics
+    tb.insert(insert_record)
+    prev_acc_count = acc_count
+
+class SyslogHandler(BaseRequestHandler):
+  lock = Lock()
+  count = 0
+  buffer = {}
+  def __init__(s,*args):
+    BaseRequestHandler.__init__(s,*args)
+  
+  def insert_data(s,tag):
+    from pymongo import MongoClient
+    m_client = MongoClient()
+    table = m_client.syslogdb.logs
+    a = []
+    with SyslogHandler.lock:
+      a = SyslogHandler.buffer[tag].copy()
+      SyslogHandler.buffer[tag].clear()
+    for e_rs in a:
+      e_rs.pop('\x00')
+      table.insert(e_rs) 
+
+  def handle(s):
+    reload(parser)
+    data = bytes.decode(s.request[0].strip())
+    socket = s.request[1]
+    addr = s.client_address
+#    print(addr,socket,data)
+    log_t = Syslog_t(data)
+    dict_rec = dict()
+    if parser.CALL_TBL.get(log_t.TAG) is not None and log_t.TAG != "-/-":
+      proc = parser.CALL_TBL.get(log_t.TAG)[0] #处理程序
+      args = parser.CALL_TBL.get(log_t.TAG)[1] #参数表
+      dict_rec = proc(log_t.MSG.replace(" ",""), **args) if type(args) is dict else proc(log_t.MSG.replace(" ",""), *args) # 调用处理程式进行日志处理，dict_rec接收返回值
+      dict_rec['time_stamp'] = log_t.DATETIME
+      dict_rec['device'] = log_t.DEVICE
+      dict_rec['type']=log_t.TAG
+      dict_rec['expireAt']=datetime.now() + timedelta(days=30) - timedelta(hours=8)
+    else: # 如果没有定义处理程序,将raw_msg写入数据库
+      dict_rec['time_stamp'] = log_t.DATETIME
+      dict_rec['device'] = log_t.DEVICE
+      dict_rec['type'] = log_t.TAG
+      dict_rec['msg'] = log_t.MSG
+      dict_rec['expireAt'] = datetime.now() + timedelta(days=30) - timedelta(hours=8)
+    with SyslogHandler.lock:
+      SyslogHandler.count = SyslogHandler.count + 1
+      if SyslogHandler.buffer.get(log_t.TAG) is not None:
+        SyslogHandler.buffer[log_t.TAG].append(dict_rec)
+      else:
+        SyslogHandler.buffer[log_t.TAG] = []
+        SyslogHandler.buffer[log_t.TAG].append(dict_rec)
+    if len(SyslogHandler.buffer[log_t.TAG])>=512:
+      insert_thread = Thread(target=SyslogHandler.insert_data,args=(s,log_t.TAG))
+      insert_thread.start()
+
+
+if __name__ == '__main__':
+  host,port = '0.0.0.0',515
+  s_time = time()
+  serv = ThreadingUDPServer((host,port),SyslogHandler)
+  counter_thread = Thread(target=counter,args=(30,))
+  counter_thread.start()
+  try:
+    serv.serve_forever()
+  except (SystemExit,KeyboardInterrupt):
+    e_time = time()
+    print("处理日志条数:{}".format(SyslogHandler.count))
+    print("时间:{}秒，处理速度:{}条每秒!".format(e_time-s_time,SyslogHandler.count/(e_time-s_time)))
